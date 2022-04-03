@@ -245,6 +245,8 @@ func (b *bucket) Init(maxBytes uint64) {
 		panic(fmt.Errorf("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize))
 	}
 	maxChunks := (maxBytes + chunkSize - 1) / chunkSize
+	// [][]byte 长度基本上都是为 1, 除非很大很大很大
+	// 注意: 这里打印 b.chunks[0] 虽然为 [], 但实际上 b.chunks[0] 为 nil
 	b.chunks = make([][]byte, maxChunks)
 	b.m = make(map[uint64]uint64)
 	b.Reset()
@@ -254,7 +256,9 @@ func (b *bucket) Reset() {
 	b.mu.Lock()
 	chunks := b.chunks
 	for i := range chunks {
+		// 归还内存
 		putChunk(chunks[i])
+		// []byte 置为 nil(这个 []byte 其实就是 [chunkSize]byte 通过 unsafe.Pointer 转换而来的)
 		chunks[i] = nil
 	}
 	bm := b.m
@@ -303,6 +307,7 @@ func (b *bucket) UpdateStats(s *Stats) {
 	b.mu.RUnlock()
 }
 
+// Set 感觉是把 idx/k/v/占用长度 都存进去了, TODO 因为一个 bucket 只有 64kb, 所以感觉会有比较大的限制吧? 后续要仔细看下
 func (b *bucket) Set(k, v []byte, h uint64) {
 	atomic.AddUint64(&b.setCalls, 1)
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
@@ -325,11 +330,15 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	chunks := b.chunks
 	needClean := false
 	b.mu.Lock()
+	// 之前的 buf 使用到的 index
 	idx := b.idx
+	// 把这个 kvh 存进来后新的 index
 	idxNew := idx + kvLen
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
+	// 如果需要用到新的 chunk 了
 	if chunkIdxNew > chunkIdx {
+		// 如果新的 index 已经大于 b.chunks 了, 设置需要 clean(因为存不下了嘛, 因为是堆外内存, 这里应该不能直接扩容)
 		if chunkIdxNew >= uint64(len(chunks)) {
 			idx = 0
 			idxNew = kvLen
@@ -344,17 +353,21 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
+		// 直接清了...
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
 	chunk := chunks[chunkIdx]
 	if chunk == nil {
+		// 返回一个切片, 这个切片很有可能是脏的
 		chunk = getChunk()
+		// 底层数组还是没有变化的, 只是切片的长度变为0了
 		chunk = chunk[:0]
 	}
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
+	// h 是 hash 值, TODO m 存的感觉是位置吧?
 	b.m[h] = idx | (b.gen << bucketSizeBits)
 	b.idx = idxNew
 	if needClean {
