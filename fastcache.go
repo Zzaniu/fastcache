@@ -108,6 +108,7 @@ func (bs *BigStats) reset() {
 //
 // Call Reset when the cache is no longer needed. This reclaims the allocated
 // memory.
+// 这里采用了分片的思想, 把一个大锁分解成了桶级别的小锁
 type Cache struct {
 	buckets [bucketsCount]bucket
 
@@ -214,6 +215,7 @@ func (c *Cache) UpdateStats(s *Stats) {
 	s.InvalidValueHashErrors += atomic.LoadUint64(&c.bigStats.InvalidValueHashErrors)
 }
 
+// bucket 存储数据的桶
 type bucket struct {
 	mu sync.RWMutex
 
@@ -237,6 +239,7 @@ type bucket struct {
 	corruptions uint64
 }
 
+// Init 初始化桶
 func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes == 0 {
 		panic(fmt.Errorf("maxBytes cannot be zero"))
@@ -252,6 +255,7 @@ func (b *bucket) Init(maxBytes uint64) {
 	b.Reset()
 }
 
+// Reset 回收每一个 []byte(堆外内存是给到 freeChunks), 且每一个都给置为 nil
 func (b *bucket) Reset() {
 	b.mu.Lock()
 	chunks := b.chunks
@@ -275,13 +279,21 @@ func (b *bucket) Reset() {
 	b.mu.Unlock()
 }
 
+// cleanLocked 清除覆盖了的数据
 func (b *bucket) cleanLocked() {
+	// 取 b.gen 的低 24 位
 	bGen := b.gen & ((1 << genSizeBits) - 1)
+	// 取最新的 idx
 	bIdx := b.idx
 	bm := b.m
 	for k, v := range bm {
+		// 获取真实的 gen
 		gen := v >> bucketSizeBits
+		// 取到真实的 idx
 		idx := v & ((1 << bucketSizeBits) - 1)
+		// 还未覆盖的不需要删除, 只删除覆盖了的嘛, 没毛病
+		// 发生覆盖(gen+1 == bGen || gen == maxGen && bGen == 1), 且 idx >= bIdx(该数据还未被覆盖),
+		// 或者未发生覆盖(gen==bGen), 且 idx < bIdx(该数据不是脏数据)
 		if (gen+1 == bGen || gen == maxGen && bGen == 1) && idx >= bIdx || gen == bGen && idx < bIdx {
 			continue
 		}
@@ -307,7 +319,8 @@ func (b *bucket) UpdateStats(s *Stats) {
 	b.mu.RUnlock()
 }
 
-// Set 感觉是把 idx/k/v/占用长度 都存进去了, TODO 因为一个 bucket 只有 64kb, 所以感觉会有比较大的限制吧? 后续要仔细看下
+// Set 感觉是把 idx/k/v/占用长度 都存进去了
+// 注意: 一个 bucket 只有 64kb, 写完了就会覆盖旧数据
 func (b *bucket) Set(k, v []byte, h uint64) {
 	atomic.AddUint64(&b.setCalls, 1)
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
@@ -316,6 +329,7 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		return
 	}
 	var kvLenBuf [4]byte
+	// 前面两个 byte 构成了 k 的长度, 后面两个构成了 v 的长度
 	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
 	kvLenBuf[1] = byte(len(k))
 	kvLenBuf[2] = byte(uint16(len(v)) >> 8)
@@ -332,61 +346,77 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	b.mu.Lock()
 	// 之前的 buf 使用到的 index
 	idx := b.idx
-	// 把这个 kvh 存进来后新的 index
+	// 把这个 k v kvLenBuf 存进来后新的 index
 	idxNew := idx + kvLen
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
-	// 如果需要用到新的 chunk 了
+	// 如果 chunk 存不下了, 需要用到新的 chunk 了
 	if chunkIdxNew > chunkIdx {
-		// 如果新的 index 已经大于 b.chunks 了, 设置需要 clean(因为存不下了嘛, 因为是堆外内存, 这里应该不能直接扩容)
+		// 如果新的 index 已经大于 len(b.chunks) 了, 设置需要 clean(因为存不下了嘛, 因为是堆外内存, 这里应该不能直接扩容)
 		if chunkIdxNew >= uint64(len(chunks)) {
+			// 让原始 idx 为0
 			idx = 0
+			// 让新的 idx 为 kvLen
 			idxNew = kvLen
+			// chunkIdx 为0, 因为大于 len(chunks) 了嘛
 			chunkIdx = 0
 			b.gen++
+			// 如果 b.gen 低24位全为0, 则再加1
 			if b.gen&((1<<genSizeBits)-1) == 0 {
 				b.gen++
 			}
 			needClean = true
 		} else {
+			// 如果原来的存不下了, 那么需要到新的 chunks 的起始位置开始存
 			idx = chunkIdxNew * chunkSize
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
-		// 直接清了...
+		// 新的 chunks 直接清了...
 		chunks[chunkIdx] = chunks[chunkIdx][:0]
 	}
 	chunk := chunks[chunkIdx]
+	// 如果是新的, 那么去堆外内存记录的 freeChunks 里面搞一个 [chunkSize]byte
 	if chunk == nil {
 		// 返回一个切片, 这个切片很有可能是脏的
 		chunk = getChunk()
-		// 底层数组还是没有变化的, 只是切片的长度变为0了
+		// 清除垃圾数据, 底层数组还是没有变化的, 只是切片的长度变为0了
 		chunk = chunk[:0]
 	}
+	// 先把长度啥的存进去
 	chunk = append(chunk, kvLenBuf[:]...)
+	// 然后把 k/v 都存进来
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
-	// h 是 hash 值, TODO m 存的感觉是位置吧?
+	// h 是 hash 值, 高 24 位存储 gen, 低40位存储 idx(注意, gen 存储进去的不可能超过24位)
 	b.m[h] = idx | (b.gen << bucketSizeBits)
 	b.idx = idxNew
 	if needClean {
+		// 把覆盖了的数据从 map 中删除(注意: 只有在发生覆盖的时候清掉覆盖了的数据, 所以 get 的时候就算map中有, 但还是要判断是否被覆盖的)
 		b.cleanLocked()
 	}
 	b.mu.Unlock()
 }
 
+// Get 获取数据
 func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 	atomic.AddUint64(&b.getCalls, 1)
 	found := false
 	chunks := b.chunks
 	b.mu.RLock()
 	v := b.m[h]
+	// 取 b.gen 的低24位(其实这个只看低24位的, 作者采用uint64我猜应该就只是好处理溢出)
 	bGen := b.gen & ((1 << genSizeBits) - 1)
 	if v > 0 {
+		// 取到 Set 存到 map 中的 gen 和 idx
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
+		// 不满足这个条件的话, 说明这个数据是被覆盖了的或者是脏数据
+		// 发生覆盖(gen+1 == bGen || gen == maxGen && bGen == 1), 且 idx >= bIdx(该数据还未被覆盖),
+		// 或者未发生覆盖(gen==bGen), 且 idx < bIdx(该数据不是脏数据)
 		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
+			// 这个从上面的 Set 来看是有问题的, 不可能这样子(因为如果大于的话, 上面 Set 是会切换 chunks 的)
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
@@ -395,27 +425,34 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			}
 			chunk := chunks[chunkIdx]
 			idx %= chunkSize
+			// 这个从上面的 Set 来看是有问题的, 不可能这样子(因为如果大于的话, 上面 Set 是会切换 chunks 的)
 			if idx+4 >= chunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			// 计算 k/v 的长度
 			kvLenBuf := chunk[idx : idx+4]
 			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
 			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
 			idx += 4
+			// 这个从上面的 Set 来看是有问题的, 不可能这样子(因为如果大于的话, 上面 Set 是会切换 chunks 的)
 			if idx+keyLen+valLen >= chunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			// 如果不想等的话, 说明不同的 key 经过 xxhash.Sum64() 得到了相同的值(就是 hash 冲突)
 			if string(k) == string(chunk[idx:idx+keyLen]) {
+				// 跳过 key 的长度
 				idx += keyLen
 				if returnDst {
+					// 这里就取到了 val
 					dst = append(dst, chunk[idx:idx+valLen]...)
 				}
 				found = true
 			} else {
+				// TODO hash 碰撞就单纯记一下? 不做别的了?
 				atomic.AddUint64(&b.collisions, 1)
 			}
 		}
@@ -428,6 +465,7 @@ end:
 	return dst, found
 }
 
+// Del 删除只需要把 map 中的哈希摘要删掉就 OK 了
 func (b *bucket) Del(h uint64) {
 	b.mu.Lock()
 	delete(b.m, h)
