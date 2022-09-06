@@ -56,7 +56,7 @@ func putChunk(chunk []byte) {
 	if chunk == nil {
 		return
 	}
-	// 这里截取一下, 因为外面还要把引用只为 nil, 只有这样, 外面的才能和这块内存失去链接
+	// 这里截取一下, 因为外面还要把引用置为 nil, 只有这样, 外面的才能和这块内存失去链接
 	chunk = chunk[:chunkSize]
 	// 将这个 []byte 转换为 [chunkSize]byte
 	p := (*[chunkSize]byte)(unsafe.Pointer(&chunk[0]))
